@@ -1,20 +1,12 @@
 package main
 
 import (
-	"bytes"
-	"encoding/binary"
-	"errors"
-	"fmt"
-	"io"
 	"log"
 	"os"
-	"path/filepath"
-
-	"github.com/pierrec/lz4/v4"
 )
 
 func main() {
-	fh, err := os.Open("./repacked.blk")
+	fh, err := os.Open("./20527480.blk")
 	if err != nil {
 		log.Fatal(err)
 	}

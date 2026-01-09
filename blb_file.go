@@ -24,9 +24,10 @@ const (
 type Blb3File struct {
 	Offset int64
 
-	HeaderKey []byte // 16 bytes header used as key material
-	Blocks    []StorageBlock
-	Nodes     []Node
+	HeaderKey   []byte // 16 bytes header used as key material
+	HeaderBytes []byte
+	Blocks      []StorageBlock
+	Nodes       []Node
 
 	// 解出来的 blocks 全部拼起来的“解压后块流”
 	BlocksStream []byte
@@ -173,11 +174,12 @@ func ParseBlb3(rs io.ReadSeeker) (*Blb3File, error) {
 	if err != nil {
 		return nil, err
 	}
+	f.HeaderBytes = headerBytes
 
 	// 关键：解密 blocksInfo+directory 的 headerBytes
-	Decrypt(f.HeaderKey, headerBytes)
+	Decrypt(f.HeaderKey, f.HeaderBytes)
 
-	blocks, nodes, err := parseBlocksInfoAndDirectory(headerBytes)
+	blocks, nodes, err := parseBlocksInfoAndDirectory(f.HeaderBytes)
 	if err != nil {
 		return nil, err
 	}

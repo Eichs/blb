@@ -102,7 +102,7 @@ func gf256Mul(a, b byte) byte {
 	if a == 0 || b == 0 {
 		return 0
 	}
-	la := int(GF256Log[a])
-	lb := int(GF256Log[b])
-	return GF256Exp[(la+lb)%0xFF]
+	la := int(gf256log[a])
+	lb := int(gf256log[b])
+	return gf256exp[(la+lb)%0xFF]
 }
