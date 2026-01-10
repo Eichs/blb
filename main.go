@@ -26,8 +26,8 @@ func main() {
 
 	for name, data := range cabs {
 		newData, err := PatchCABBytes(name, data, ConfigPatch{
-			ChannelName: "hello mihoyo",
-			DispatchURL: "https://dispatchosglobal.yuanshen.com/query_region_list",
+			ChannelName: "CNRELWin",
+			DispatchURL: "https://sdk.yuanshen.org.cn/query_region_list",
 			KeyID:       5,
 		})
 		if err != nil {

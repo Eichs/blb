@@ -58,7 +58,7 @@ func Scramble(buf []byte) {
 	}
 }
 
-// Descramble: 完全照 C#
+// Descramble:
 // for i in 0..2:
 //
 //	for j in 0..len-1:

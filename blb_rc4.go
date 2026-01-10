@@ -44,9 +44,7 @@ func RC4Encrypt(buf []byte) {
 	}
 }
 
-// RC4: 完全照 C# 的写法（注意它不是标准 RC4，后面还有 xor/sub/add 三种操作）
-//
-// C#:
+// RC4:  注意它不是标准 RC4，后面还有 xor/sub/add 三种操作）
 // byte[] S = new byte[256]; BlbRC4Key.CopyTo(S,0);
 // byte[] T = new byte[256];
 // for (i=0; i<256; i+=2) { T[i]=buf[i&6]; T[i+1]=buf[(i+1)&7]; }
