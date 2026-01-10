@@ -4,11 +4,6 @@ import (
 	"fmt"
 )
 
-var (
-// === Blb3 自定义 AES 用 ===
-// AES SBox（SubBytes 用，注意是 XOR，不是替换）
-)
-
 // Decrypt 按 C#：
 // buffer = buffer[..Math.Min(128, buffer.Length)]
 // 1) 首 16 字节 XOR header
