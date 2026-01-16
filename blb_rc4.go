@@ -55,6 +55,7 @@ func RC4Encrypt(buf []byte) {
 //	K=S[(S[j]+S[i])%256]
 //	switch (buf[(i%8)+8]%3) { xor / -= / += } on buf[iteration+0x10]
 func RC4Decrypt(buf []byte) {
+
 	if len(buf) <= 16 {
 		return
 	}

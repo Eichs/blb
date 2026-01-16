@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -171,8 +172,15 @@ func (br *binReader) ReadStringToNull() (string, error) {
 
 func ParseBlb3(rs io.ReadSeeker) (*Blb3File, error) {
 	br := newBinReader(rs)
-	f := &Blb3File{Offset: br.Pos()}
+	startOff := br.Pos()
+	f := &Blb3File{Offset: startOff}
 
+	// ---------- 0) 文件总长 ----------
+	endPos, _ := rs.Seek(0, io.SeekEnd)
+	_, _ = rs.Seek(startOff, io.SeekStart)
+	fileSize := endPos - startOff
+
+	// ---------- 1) sig ----------
 	sig, err := br.ReadStringToNullFixed(4)
 	if err != nil {
 		return nil, err
@@ -181,49 +189,133 @@ func ParseBlb3(rs io.ReadSeeker) (*Blb3File, error) {
 		return nil, fmt.Errorf("not a Blb3 file, sig=%q", sig)
 	}
 
-	size, err := br.ReadU32()
+	// ---------- 2) blocksInfoSize ----------
+	sizeU32, err := br.ReadU32()
+	if err != nil {
+		return nil, err
+	}
+	size := int64(sizeU32)
+
+	// ---------- 3) outerFlag (skip) ----------
+	outerFlag, err := br.ReadU32()
 	if err != nil {
 		return nil, err
 	}
 
-	// skip 4 bytes (C# reader.ReadUInt32();)
-	if _, err := br.ReadU32(); err != nil { //对应5
-		return nil, err
-	}
-
+	// ---------- 4) headerKey ----------
 	headerKey, err := br.ReadBytes(16)
 	if err != nil {
 		return nil, err
 	}
 	f.HeaderKey = headerKey
 
-	headerBytes, err := br.ReadBytes(int(size))
+	// ---------- 5) size 合法性检查 ----------
+	// 至少要能容纳固定头 (56 bytes 起步)；也别大于文件剩余
+	cur := br.Pos()
+	remain := (startOff + fileSize) - cur
+	if size < 56 {
+		return nil, fmt.Errorf("blocksInfoSize too small: %d (<56). outerFlag=0x%X key=%s",
+			size, outerFlag, hex.EncodeToString(headerKey))
+	}
+	if size > remain {
+		return nil, fmt.Errorf("blocksInfoSize too large: %d, remain=%d (fileSize=%d). outerFlag=0x%X",
+			size, remain, fileSize, outerFlag)
+	}
+
+	// ---------- 6) 读 headerBytes(密文) ----------
+	headerBytesEnc, err := br.ReadBytes(int(size))
 	if err != nil {
 		return nil, err
 	}
-	f.HeaderBytes = headerBytes
+	f.HeaderBytes = headerBytesEnc
 
-	// 关键：解密 headerBytes
-	Decrypt(f.HeaderKey, f.HeaderBytes)
-
-	// 完整解析 headerBytes：header字段 + blocks + nodes
-	hdr, blocks, nodes, err := parseHeaderBytesAll(f.HeaderBytes)
-	if err != nil {
-		return nil, err
+	// 额外：打印密文前 64 字节（不泄露就不管了，反正你自己用）
+	{
+		n := 64
+		if len(headerBytesEnc) < n {
+			n = len(headerBytesEnc)
+		}
+		fmt.Printf("[BLB3] fileSize=%d start=0x%X blocksInfoSize=%d outerFlag=0x%08X\n",
+			fileSize, startOff, size, outerFlag)
+		fmt.Printf("[BLB3] headerKey=%s\n", hex.EncodeToString(headerKey))
+		fmt.Printf("[BLB3] headerEnc[0:%d]=% X\n", n, headerBytesEnc[:n])
 	}
+
+	// ---------- 7) 解密 headerBytes ----------
+	headerBytesDec := append([]byte(nil), headerBytesEnc...) // 不要原地改 f.HeaderBytes，方便对比
+	Decrypt(headerKey, headerBytesDec)
+
+	{
+		n := 64
+		if len(headerBytesDec) < n {
+			n = len(headerBytesDec)
+		}
+		fmt.Printf("[BLB3] headerDec[0:%d]=% X\n", n, headerBytesDec[:n])
+
+		// 直接把关键字段按小端读出来（不依赖 parseHeaderBytesAll）
+		// 0x00 u32 headerSize
+		// 0x04 u32 lastUnc
+		// 0x08 u32 innerReserved
+		// 0x0C i32 blobOffset
+		// 0x10 u32 blobSize
+		// 0x14 u8 comp
+		// 0x15 u8 blockPow
+		// 0x18 i32 blocksCount
+		// 0x1C i32 nodesCount
+		if len(headerBytesDec) >= 0x20 {
+			hSz := leU32(headerBytesDec[0x00:0x04])
+			lastUnc := leU32(headerBytesDec[0x04:0x08])
+			innerRes := leU32(headerBytesDec[0x08:0x0C])
+			blobOff := leI32(headerBytesDec[0x0C:0x10])
+			blobSz := leU32(headerBytesDec[0x10:0x14])
+			comp := headerBytesDec[0x14]
+			blockPow := headerBytesDec[0x15]
+			blocksCount := leI32(headerBytesDec[0x18:0x1C])
+			nodesCount := leI32(headerBytesDec[0x1C:0x20])
+
+			fmt.Printf("[BLB3] decFields headerSizeU32=%d(0x%X) lastUnc=%d(0x%X) innerReserved=0x%X blobOff=%d blobSz=%d comp=%d blockPow=%d blocksCount=%d nodesCount=%d\n",
+				hSz, hSz, lastUnc, lastUnc, innerRes, blobOff, blobSz, comp, blockPow, blocksCount, nodesCount)
+		}
+	}
+
+	// ---------- 8) 用解密后的 bytes 去 parseHeaderBytesAll ----------
+	hdr, blocks, nodes, perr := parseHeaderBytesAll(headerBytesDec)
+	if perr != nil {
+		// 失败时把解密后的 headerBytes 写出来，方便你 hex diff
+		_ = os.WriteFile("header_dec_dump.bin", headerBytesDec, 0o644)
+		_ = os.WriteFile("header_enc_dump.bin", headerBytesEnc, 0o644)
+
+		// 再给你多一层提示：通常 blocksCount/nodesCount 乱 => size/范围不对 或 Encrypt/Decrypt 不可逆
+		return nil, fmt.Errorf("parseHeaderBytesAll failed: %w (wrote header_enc_dump.bin & header_dec_dump.bin)", perr)
+	}
+
 	f.Header = hdr
 	f.Blocks = blocks
 	f.Nodes = nodes
 
-	// 读取 blocks + 解压/解密拼出 BlocksStream
-	blocksStream, err := readBlocksAndBuildStream(br, f.HeaderKey, f.Blocks)
+	// ---------- 9) 读取 blocks + 解压/解密拼出 BlocksStream ----------
+	blocksStream, err := readBlocksAndBuildStream(br, headerKey, blocks)
 	if err != nil {
 		return nil, err
 	}
 	f.BlocksStream = blocksStream
 
+	// ---------- 10) 一些 sanity check ----------
+	// blocksInfoSize 应等于 hdr bytes 实际长度（你的样本是 1916）
+	if int64(len(headerBytesEnc)) != size {
+		fmt.Printf("[WARN] headerBytesEnc len(%d) != size(%d)\n", len(headerBytesEnc), size)
+	}
+	// 如果你认为 headerSizeU32 语义是 “blb fileSize”，你也可以在这里对照输出：
+	// fmt.Printf("[BLB3] hdr.HeaderSize=%d fileSize=%d\n", hdr.HeaderSize, fileSize)
+
 	return f, nil
 }
+
+// ---- 小端工具（不依赖 encoding/binary，避免额外 import） ----
+func leU32(b []byte) uint32 {
+	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+}
+func leI32(b []byte) int32 { return int32(leU32(b)) }
 
 // -------------------- 解析 headerBytes（对应 C# ReadBlocksInfoAndDirectory） --------------------
 
@@ -242,10 +334,13 @@ func parseHeaderBytesAll(headerBytes []byte) (*Blb3HeaderBytes, []StorageBlock, 
 		return nil, nil, nil, err
 	}
 
-	// reader.Position += 4;
-	if err := br.Skip(4); err != nil {
+	// reader.Position += 4; 其实是一个 u32 保留字段（innerReservedU32）
+	posBefore := br.Pos()
+	innerRes, err := br.ReadU32()
+	if err != nil {
 		return nil, nil, nil, err
 	}
+	fmt.Printf("[BLB3] innerReservedU32 @0x%X = 0x%08X (%d)\n", posBefore, innerRes, innerRes)
 
 	// blobOffset / blobSize
 	if h.BlobOffset, err = br.ReadI32(); err != nil {
@@ -515,203 +610,6 @@ func (f *Blb3File) ExtractAllToBytes() (map[string][]byte, error) {
 	return out, nil
 }
 
-//打包流程
-//u32 HeaderSize                  // 0x4BD
-//u32 LastUncompressedSize         // 0x1548
-//u32 (skip4 bytes)               // C# Position +=4
-//i32 BlobOffset                  // 0
-//u32 BlobSize                    // 0
-//u8  CompressionType             // 3 = LZ4
-//u8  BlockPow                    // 17
-//align4
-//i32 BlocksInfoCount             // 1
-//i32 NodesCount                  // 1
-//
-//i64 relBlocksInfoOffset   // 计算方式：ABS = (posBeforeReadI64) + rel
-//i64 relNodesInfoOffset
-//i64 relFlagInfoOffset
-//
-//// blocksInfo table @ blocksInfoOffsetAbs:
-//repeat BlocksInfoCount:
-//    u32 cumulativeCompressedSize  // 注意：C# 读的是“累计值”，后面会做差得到每块大小
-//
-//// nodes table @ nodesInfoOffsetAbs:
-//repeat NodesCount:
-//    i32 offset
-//    i32 size
-//    i64 relPathOffset             // ABS = (posBeforeReadI64) + rel
-//// path strings @ pathOffsetAbs:
-//    "xxx\0"
-//
-//// flags area @ flagInfoOffsetAbs:
-//u32 flagWord0
-//u32 flagWord1 (只有 i>=0x20 才会去读第二个)
-//node.flags = (flagWord & (1<<(i&31))) * 4
-
-func RepackCABsFromDir(unpackDir, outPath string, headerKey []byte, blockPow byte, comp CompressionType) error {
-	if len(headerKey) != 16 {
-		return fmt.Errorf("headerKey must be 16 bytes, got=%d", len(headerKey))
-	}
-
-	cabPaths, cabNames, err := findAllCABsSorted(unpackDir)
-	if err != nil {
-		return err
-	}
-	if len(cabPaths) == 0 {
-		return fmt.Errorf("no CAB-* file found in %s", unpackDir)
-	}
-
-	// 读取所有 CAB，构建 BlocksStream + Nodes
-	var blocksStream bytes.Buffer
-	nodes := make([]Node, 0, len(cabPaths))
-
-	var offset int64 = 0
-	for i := 0; i < len(cabPaths); i++ {
-		data, err := os.ReadFile(cabPaths[i])
-		if err != nil {
-			return err
-		}
-		if len(data) == 0 {
-			return fmt.Errorf("CAB file is empty: %s", cabPaths[i])
-		}
-
-		nodes = append(nodes, Node{
-			Offset: int32(offset),
-			Size:   int32(len(data)),
-			Flags:  0,           // 这里不用直接写，解析时 flags 来自 flagWords
-			Path:   cabNames[i], // 只要文件名
-		})
-
-		_, _ = blocksStream.Write(data)
-		offset += int64(len(data))
-	}
-
-	// 先写 blocks（压缩/加密）
-	blockSize := 1 << blockPow
-	blocksPayload, blocksMeta, lastUnc, err := buildBlocksPayload(blocksStream.Bytes(), headerKey, blockSize, comp)
-	if err != nil {
-		return err
-	}
-
-	// 构建 headerBytes 明文 多node
-	hdrPlain, err := buildHeaderBytes(blockPow, comp, uint32(lastUnc), blocksMeta, nodes)
-	if err != nil {
-		return err
-	}
-
-	// headerBytes 加密
-	hdrEnc := append([]byte(nil), hdrPlain...)
-	Encrypt(headerKey, hdrEnc)
-
-	// 写出最终 blb
-	f, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// 文件头
-	if _, err := f.Write([]byte{'B', 'l', 'b', 0x03}); err != nil {
-		return err
-	}
-	if err := writeU32LE(f, uint32(len(hdrEnc))); err != nil {
-		return err
-	}
-	// C# reader.ReadUInt32();//5
-	if err := writeU32LE(f, 5); err != nil {
-		return err
-	}
-	if _, err := f.Write(headerKey); err != nil {
-		return err
-	}
-	if _, err := f.Write(hdrEnc); err != nil {
-		return err
-	}
-
-	// blocks 区域（已加密）
-	if _, err := f.Write(blocksPayload); err != nil {
-		return err
-	}
-
-	return nil
-}
-func RepackCABsFromBytes(cabs map[string][]byte, outPath string, headerKey []byte, blockPow byte, comp CompressionType) error {
-
-	if len(headerKey) != 16 {
-		return fmt.Errorf("headerKey must be 16 bytes")
-	}
-	if len(cabs) == 0 {
-		return fmt.Errorf("no CAB data")
-	}
-
-	// 排序，保证和原版一致
-	names := make([]string, 0, len(cabs))
-	for name := range cabs {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	var blocksStream bytes.Buffer
-	nodes := make([]Node, 0, len(names))
-	var offset int64
-
-	for _, name := range names {
-		data := cabs[name]
-		if len(data) == 0 {
-			return fmt.Errorf("CAB empty: %s", name)
-		}
-
-		nodes = append(nodes, Node{
-			Offset: int32(offset),
-			Size:   int32(len(data)),
-			Flags:  0,
-			Path:   name,
-		})
-
-		blocksStream.Write(data)
-		offset += int64(len(data))
-	}
-
-	// blocks
-	blockSize := 1 << blockPow
-	blocksPayload, blocksMeta, lastUnc, err :=
-		buildBlocksPayload(blocksStream.Bytes(), headerKey, blockSize, comp)
-	if err != nil {
-		return err
-	}
-
-	// header
-	hdrPlain, err := buildHeaderBytes(
-		blockPow,
-		comp,
-		uint32(lastUnc),
-		blocksMeta,
-		nodes,
-	)
-	if err != nil {
-		return err
-	}
-
-	hdrEnc := append([]byte(nil), hdrPlain...)
-	Encrypt(headerKey, hdrEnc)
-
-	f, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// blb header
-	f.Write([]byte{'B', 'l', 'b', 0x03})
-	writeU32LE(f, uint32(len(hdrEnc)))
-	writeU32LE(f, 5)
-	f.Write(headerKey)
-	f.Write(hdrEnc)
-	f.Write(blocksPayload)
-
-	return nil
-}
-
 // -------------------- blocks: 压缩/选择 None/加密/拼接 --------------------
 
 func buildBlocksPayload(blocksStream []byte, headerKey []byte, blockSize int, comp CompressionType) (payload []byte, blocks []StorageBlock, lastUnc int, err error) {
@@ -745,19 +643,29 @@ func buildBlocksPayload(blocksStream []byte, headerKey []byte, blockSize int, co
 
 		switch comp {
 		case CompressionLz4, CompressionLz4HC:
-			// 尝试压缩
 			maxDst := lz4.CompressBlockBound(usz)
 			dst := make([]byte, maxDst)
-			n, cErr := lz4.CompressBlock(uncomp, dst, nil)
+
+			var n int
+			var cErr error
+
+			if comp == CompressionLz4HC {
+				// HC level=12 (你跟 C# 一致)
+				n, cErr = lz4.CompressBlockHC(uncomp, dst, 12, nil, nil)
+			} else {
+				// 普通 LZ4
+				n, cErr = lz4.CompressBlock(uncomp, dst, nil)
+			}
+
 			if cErr != nil {
 				return nil, nil, 0, fmt.Errorf("lz4 compress block %d failed: %w", bi, cErr)
 			}
+
 			if n > 0 && n < usz {
-				// 压缩有效
 				blkType = comp
 				toWrite = dst[:n]
 			} else {
-				// 压不动：写 raw，并标 None（与 C# 解包的判断一致）
+				// 压不动：写 raw，并标 None（和 C# 解包判断一致）
 				blkType = CompressionNone
 				toWrite = append([]byte(nil), uncomp...)
 			}
@@ -770,6 +678,7 @@ func buildBlocksPayload(blocksStream []byte, headerKey []byte, blockSize int, co
 			return nil, nil, 0, fmt.Errorf("unsupported compression type for repack: %d (only None/LZ4/LZ4HC)", comp)
 		}
 
+		// 只影响前 128 字节（你的 Encrypt 实现就是这样）
 		Encrypt(headerKey, toWrite)
 
 		_, _ = out.Write(toWrite)
@@ -784,6 +693,197 @@ func buildBlocksPayload(blocksStream []byte, headerKey []byte, blockSize int, co
 	return out.Bytes(), blocks, lastUnc, nil
 }
 
+func isCABMain(name string) bool {
+	// 原版：主 CAB 文件 flags=0x4，.resS flags=0
+	// 你现在 dump 里就是这样
+	return strings.HasPrefix(name, "CAB-") && !strings.HasSuffix(name, ".resS")
+}
+
+func patchHeaderSizeAsFileTotal(hdrPlain []byte, blocksPayloadLen int) {
+	// HeaderSizeU32 = blb 文件总长度
+	// 4("Blb\x03")+4(blocksInfoSize)+4(outerFlag)+16(headerKey)+len(headerBytes)+blocksPayloadLen
+	total := 4 + 4 + 4 + 16 + len(hdrPlain) + blocksPayloadLen
+	patchU32LE(hdrPlain, 0, uint32(total))
+}
+
+// -------------------- repack from dir --------------------
+
+func RepackCABsFromDir(unpackDir, outPath string, headerKey []byte, blockPow byte, comp CompressionType) error {
+	if len(headerKey) != 16 {
+		return fmt.Errorf("headerKey must be 16 bytes, got=%d", len(headerKey))
+	}
+
+	// 硬编 key
+	headerKey, _ = hex.DecodeString("36790E79C7BFD31AE36B5209EDD1EC1C")
+
+	cabPaths, cabNames, err := findAllCABsSorted(unpackDir)
+	if err != nil {
+		return err
+	}
+	if len(cabPaths) == 0 {
+		return fmt.Errorf("no CAB-* file found in %s", unpackDir)
+	}
+
+	// 读取所有 CAB，构建 BlocksStream + Nodes
+	var blocksStream bytes.Buffer
+	nodes := make([]Node, 0, len(cabPaths))
+
+	var offset int64 = 0
+	for i := 0; i < len(cabPaths); i++ {
+		data, err := os.ReadFile(cabPaths[i])
+		if err != nil {
+			return err
+		}
+		if len(data) == 0 {
+			return fmt.Errorf("CAB file is empty: %s", cabPaths[i])
+		}
+
+		// ✅ 修复：flags 规则
+		var flags uint32 = 0
+		if isCABMain(cabNames[i]) {
+			flags = 4
+		}
+
+		nodes = append(nodes, Node{
+			Offset: int32(offset),
+			Size:   int32(len(data)),
+			Flags:  flags,
+			Path:   cabNames[i], // 只要文件名
+		})
+
+		_, _ = blocksStream.Write(data)
+		offset += int64(len(data))
+	}
+
+	// blocks（压缩/加密）
+	blockSize := 1 << blockPow
+	blocksPayload, blocksMeta, lastUnc, err := buildBlocksPayload(blocksStream.Bytes(), headerKey, blockSize, comp)
+	if err != nil {
+		return err
+	}
+
+	// headerBytes 明文
+	hdrPlain, err := buildHeaderBytes(blockPow, comp, uint32(lastUnc), blocksMeta, nodes)
+	if err != nil {
+		return err
+	}
+
+	// ✅ 关键：回填 HeaderSizeU32 = blb 总长度（在加密之前！）
+	patchHeaderSizeAsFileTotal(hdrPlain, len(blocksPayload))
+
+	// headerBytes 加密（只影响前 128）
+	hdrEnc := append([]byte(nil), hdrPlain...)
+	Encrypt(headerKey, hdrEnc)
+
+	// 写出 blb
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if _, err := f.Write([]byte{'B', 'l', 'b', 0x03}); err != nil {
+		return err
+	}
+	if err := writeU32LE(f, uint32(len(hdrEnc))); err != nil {
+		return err
+	}
+	// outerFlag（你样本是 5）
+	if err := writeU32LE(f, 5); err != nil {
+		return err
+	}
+	if _, err := f.Write(headerKey); err != nil {
+		return err
+	}
+	if _, err := f.Write(hdrEnc); err != nil {
+		return err
+	}
+	if _, err := f.Write(blocksPayload); err != nil {
+		return err
+	}
+	return nil
+}
+
+// -------------------- repack from bytes --------------------
+
+func RepackCABsFromBytes(cabs map[string][]byte, outPath string, headerKey []byte, blockPow byte, comp CompressionType) error {
+	if len(headerKey) != 16 {
+		return fmt.Errorf("headerKey must be 16 bytes")
+	}
+	if len(cabs) == 0 {
+		return fmt.Errorf("no CAB data")
+	}
+
+	// 排序保证稳定
+	names := make([]string, 0, len(cabs))
+	for name := range cabs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var blocksStream bytes.Buffer
+	nodes := make([]Node, 0, len(names))
+	var offset int64
+
+	for _, name := range names {
+		data := cabs[name]
+		if len(data) == 0 {
+			return fmt.Errorf("CAB empty: %s", name)
+		}
+
+		// ✅ 修复：flags 规则
+		var flags uint32 = 0
+		if isCABMain(name) {
+			flags = 4
+		}
+
+		nodes = append(nodes, Node{
+			Offset: int32(offset),
+			Size:   int32(len(data)),
+			Flags:  flags,
+			Path:   name,
+		})
+
+		blocksStream.Write(data)
+		offset += int64(len(data))
+	}
+
+	// blocks
+	blockSize := 1 << blockPow
+	blocksPayload, blocksMeta, lastUnc, err := buildBlocksPayload(blocksStream.Bytes(), headerKey, blockSize, comp)
+	if err != nil {
+		return err
+	}
+
+	// header
+	hdrPlain, err := buildHeaderBytes(blockPow, comp, uint32(lastUnc), blocksMeta, nodes)
+	if err != nil {
+		return err
+	}
+
+	// ✅ 关键：回填 HeaderSizeU32 = blb 总长度（在加密之前！）
+	patchHeaderSizeAsFileTotal(hdrPlain, len(blocksPayload))
+
+	hdrEnc := append([]byte(nil), hdrPlain...)
+	Encrypt(headerKey, hdrEnc)
+
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	f.Write([]byte{'B', 'l', 'b', 0x03})
+	writeU32LE(f, uint32(len(hdrEnc)))
+	writeU32LE(f, 5)
+	f.Write(headerKey)
+	f.Write(hdrEnc)
+	f.Write(blocksPayload)
+	return nil
+}
+
+// -------------------- headerBytes builder (不写 HeaderSize) --------------------
+
 func buildHeaderBytes(blockPow byte, comp CompressionType, lastUnc uint32, blocks []StorageBlock, nodes []Node) ([]byte, error) {
 	if len(nodes) < 1 {
 		return nil, fmt.Errorf("no nodes")
@@ -792,20 +892,18 @@ func buildHeaderBytes(blockPow byte, comp CompressionType, lastUnc uint32, block
 		return nil, fmt.Errorf("no blocks")
 	}
 
-	// 写 headerBytes（明文）
 	var buf bytes.Buffer
 
-	// 1) HeaderSize 占位（最后回填）
-	headerSizePos := buf.Len()
+	// 1) HeaderSize 占位（外层回填为 blb 总长度）
 	_ = writeU32ToBuf(&buf, 0)
 
 	// 2) LastUncompressedSize
 	_ = writeU32ToBuf(&buf, lastUnc)
 
-	// 3) skip4 bytes（C# Position +=4）
+	// 3) innerReserved/skip4（样本是 0）
 	_ = writeU32ToBuf(&buf, 0)
 
-	// 4) blobOffset/blobSize（样本为 0）
+	// 4) blobOffset/blobSize（样本是 0）
 	_ = writeI32ToBuf(&buf, 0)
 	_ = writeU32ToBuf(&buf, 0)
 
@@ -822,17 +920,15 @@ func buildHeaderBytes(blockPow byte, comp CompressionType, lastUnc uint32, block
 	_ = writeI32ToBuf(&buf, int32(len(blocks)))
 	_ = writeI32ToBuf(&buf, int32(len(nodes)))
 
-	// 8) 三个 relOffset 占位（按“写 int64 前 pos”规则回填）
+	// 8) relOffset 占位（abs = posBeforeReadI64 + rel）
 	blocksRelPos := buf.Len()
 	_ = writeI64ToBuf(&buf, 0)
-
 	nodesRelPos := buf.Len()
 	_ = writeI64ToBuf(&buf, 0)
-
 	flagsRelPos := buf.Len()
 	_ = writeI64ToBuf(&buf, 0)
 
-	// 9) blocksInfo：记录 abs + 写累计 compressedSize
+	// 9) blocksInfo：累计 compressedSize
 	blocksInfoAbs := int64(buf.Len())
 	var cum uint32
 	for i := 0; i < len(blocks); i++ {
@@ -840,61 +936,57 @@ func buildHeaderBytes(blockPow byte, comp CompressionType, lastUnc uint32, block
 		_ = writeU32ToBuf(&buf, cum)
 	}
 
-	// 10) nodesInfo：记录 abs + 写 nodes 表（offset/size + relPathOffset 占位）
+	// 10) nodesInfo：offset/size + relPathOffset
 	nodesInfoAbs := int64(buf.Len())
 	nodePathRelPos := make([]int, len(nodes))
-
 	for i := 0; i < len(nodes); i++ {
 		_ = writeI32ToBuf(&buf, nodes[i].Offset)
 		_ = writeI32ToBuf(&buf, nodes[i].Size)
 		nodePathRelPos[i] = buf.Len()
-		_ = writeI64ToBuf(&buf, 0) // placeholder
+		_ = writeI64ToBuf(&buf, 0)
 	}
 
-	// 11) flags：记录 abs + 写足够的 flagWords
-	flagsAbs := int64(buf.Len())
+	// 11) string table：路径 + \0
+	pathAbsList := make([]int64, len(nodes))
+	for i := 0; i < len(nodes); i++ {
+		pathAbsList[i] = int64(buf.Len())
+		_, _ = buf.WriteString(nodes[i].Path)
+		_ = buf.WriteByte(0)
+	}
 
-	// 每 32 个 node 一个 word
+	// 12) align4 before flags（保持样本 flagsAbs=0x778 这种对齐）
+	for (buf.Len() & 3) != 0 {
+		_ = buf.WriteByte(0)
+	}
+
+	// 13) flags bitmap（放最后）
+	flagsAbs := int64(buf.Len())
 	wordCount := (len(nodes) + 31) / 32
 	flagWords := make([]uint32, wordCount)
-
-	// 自动：把所有 node 的 bit 都置 1（和你单文件 node0=1 同逻辑）
 	for i := 0; i < len(nodes); i++ {
-		w := i / 32
-		bit := uint32(1) << uint32(i&31)
-		flagWords[w] |= bit
+		if nodes[i].Flags != 0 {
+			w := i / 32
+			bit := uint32(1) << uint32(i&31)
+			flagWords[w] |= bit
+		}
 	}
-
 	for _, w := range flagWords {
 		_ = writeU32ToBuf(&buf, w)
 	}
 
-	// 12) string table：逐个写 path (只用文件名) + '\0'，并回填 relPathOffset
 	raw := buf.Bytes()
 
+	// patch node relPathOffset：rel = pathAbs - fieldPos
 	for i := 0; i < len(nodes); i++ {
-		pathAbs := int64(buf.Len())
-		// 只要文件名
-		name := filepath.Base(nodes[i].Path)
-		_, _ = buf.WriteString(name)
-		_ = buf.WriteByte(0)
-
-		// rel = pathAbs - posBeforeWriteI64
-		posBefore := int64(nodePathRelPos[i])
-		rel := pathAbs - posBefore
+		posBefore := int64(nodePathRelPos[i]) // 字段起始 pos（和你 parse 的 base 一致）
+		rel := pathAbsList[i] - posBefore
 		patchI64LE(raw, nodePathRelPos[i], rel)
 	}
 
-	// ⚠️ buf.Bytes() 可能因为增长而换底层数组，所以重新拿 raw
-	raw = buf.Bytes()
-
-	// 13) 回填 3 个 rel offsets（同规则：targetAbs - posBeforeWriteI64）
+	// patch 3 relOffset（base=字段起始 pos）
 	patchI64LE(raw, blocksRelPos, blocksInfoAbs-int64(blocksRelPos))
 	patchI64LE(raw, nodesRelPos, nodesInfoAbs-int64(nodesRelPos))
 	patchI64LE(raw, flagsRelPos, flagsAbs-int64(flagsRelPos))
-
-	// 14) 回填 HeaderSize = len(headerBytes)
-	patchU32LE(raw, headerSizePos, uint32(len(raw)))
 
 	return raw, nil
 }

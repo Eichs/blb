@@ -1,8 +1,6 @@
 package main
 
-import (
-	"fmt"
-)
+import "fmt"
 
 // Decrypt 按 C#：
 // buffer = buffer[..Math.Min(128, buffer.Length)]
